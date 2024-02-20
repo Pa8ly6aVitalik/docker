@@ -1,0 +1,209 @@
+networks:
+  zabbix-network:
+    external: true
+  traefik-network:
+    external: true
+
+volumes:
+  zabbix-postgres:
+  zabbix-postgres-backup:
+  zabbix-database-backups:
+  traefik-certificates:
+
+services:
+  postgres:
+    image: postgres:12.5
+    volumes:
+      - zabbix-postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: 'zabbixdb'
+      POSTGRES_USER: 'postgres'
+      POSTGRES_PASSWORD: 'postgres'
+    networks:
+      - zabbix-network
+    ports:
+      - "5432:5432"
+    
+    healthcheck:
+      test: [ "CMD", "pg_isready", "-q", "-d", "zabbixdb", "-U", "postgres" ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:ubuntu-5.2.2
+    environment:
+      DB_SERVER_HOST: postgres
+      DB_SERVER_PORT: 5432
+      POSTGRES_DB: zabbixdb 
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    networks:
+      - zabbix-network
+      - traefik-network
+    healthcheck:
+      test: grep -qr "zabbix_server" /proc/*/status || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.tcp.routers.zabbix-server-tcp.rule=HostSNI(`*`)"
+      - "traefik.tcp.routers.zabbix-server-tcp.service=zabbix-server-tcp"
+      - "traefik.tcp.routers.zabbix-server-tcp.entrypoints=zabbix-tcp"
+      - "traefik.tcp.services.zabbix-server-tcp.loadbalancer.server.port=10051"
+      - "traefik.udp.routers.zabbix-server-udp.service=zabbix-server-udp"
+      - "traefik.udp.routers.zabbix-server-udp.entrypoints=zabbix-udp"
+      - "traefik.udp.services.zabbix-server-udp.loadbalancer.server.port=10051"
+      - "traefik.docker.network=traefik-network"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    
+
+  zabbix-dashboard:
+    image: zabbix/zabbix-web-apache-pgsql:ubuntu-5.2.2
+    environment:
+      DB_SERVER_HOST: postgres
+      DB_SERVER_PORT: 5432
+      POSTGRES_DB: zabbixdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      ZBX_SERVER_HOST: zabbix-server
+      PHP_TZ: Europe/Moscow
+    networks:
+      - zabbix-network
+      - traefik-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.zabbix-dashboard.rule=Host(`zabbix.local-usznchertkovo.ru`)"
+      - "traefik.http.routers.zabbix-dashboard.service=zabbix-dashboard"
+      - "traefik.http.routers.zabbix-dashboard.entrypoints=websecure"
+      - "traefik.http.services.zabbix-dashboard.loadbalancer.server.port=8080"
+      - "traefik.http.routers.zabbix-dashboard.tls=true"
+      - "traefik.http.routers.zabbix-dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.services.zabbix-dashboard.loadbalancer.passhostheader=true"
+      - "traefik.http.routers.zabbix-dashboard.middlewares=compresstraefik"
+      - "traefik.http.middlewares.compresstraefik.compress=true"
+      - "traefik.docker.network=traefik-network"
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      zabbix-server:
+        condition: service_healthy
+      traefik:
+        condition: service_healthy
+    ports:
+      - "8989:8080"
+
+  zabbix-agent:
+    image: zabbix/zabbix-agent:ubuntu-5.2.2
+    environment:
+      ZBX_HOSTNAME: Zabbix server
+      ZBX_SERVER_HOST: zabbix-server
+    networks:
+      - zabbix-network
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - zabbix-server
+    
+  traefik:
+    image: traefik:2.3
+    command:
+      - "--log.level=WARN"
+      - "--accesslog=true"
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      - "--ping=true"
+      - "--ping.entrypoint=ping"
+      - "--entryPoints.ping.address=:8082"
+      - "--entryPoints.web.address=:80"
+      - "--entryPoints.websecure.address=:443"
+      - "--entryPoints.zabbix-tcp.address=:10051"
+      - "--entryPoints.zabbix-udp.address=:10051/udp"
+      - "--providers.docker=true"
+      - "--providers.docker.endpoint=unix:///var/run/docker.sock"
+      - "--providers.docker.exposedByDefault=false"
+      - "--certificatesresolvers.letsencrypt.acme.tlschallenge=true"
+      - "--certificatesresolvers.letsencrypt.acme.email=uszn-cher@yandex.ru"
+      - "--certificatesresolvers.letsencrypt.acme.storage=/etc/traefik/acme/acme.json"
+      - "--metrics.prometheus=true"
+      - "--metrics.prometheus.buckets=0.1,0.3,1.2,5.0"
+      - "--global.checkNewVersion=true"
+      - "--global.sendAnonymousUsage=false"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - traefik-certificates:/etc/traefik/acme
+    networks:
+      - traefik-network
+    ports:
+      - "80:80"
+      - "443:443"
+      - "10050:10050"
+      - "10051:10051"
+    healthcheck:
+      test: ["CMD", "wget", "http://localhost:8082/ping","--spider"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.local-usznchertkovo.ru`)"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.services.dashboard.loadbalancer.server.port=8080"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.tls.certresolver=letsencrypt"
+      - "traefik.http.services.dashboard.loadbalancer.passhostheader=true"
+      - "traefik.http.routers.dashboard.middlewares=authtraefik"
+      - "traefik.http.middlewares.authtraefik.basicauth.users=traefikadmin:admin"
+      - "traefik.http.routers.http-catchall.rule=HostRegexp(`{host:.+}`)"
+      - "traefik.http.routers.http-catchall.entrypoints=web"
+      - "traefik.http.routers.http-catchall.middlewares=redirect-to-https"
+      - "traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https"
+    restart: unless-stopped
+
+  backups:
+    image: postgres:12.5
+    command: >-
+      sh -c 'sleep 30m &&
+      while true; do
+        pg_dump -h postgres -p 5432 -d zabbixdb -U postgres | gzip > /srv/zabbix-postgres/backups/zabbix-postgres-backup-$$(date "+%Y-%m-%d_%H-%M").gz &&
+        find /srv/zabbix-postgres/backups -type f -mtime +7 | xargs rm -f &&
+        sleep 24h; done'
+    volumes:
+      - zabbix-postgres-backup:/var/lib/postgresql/data
+      - zabbix-database-backups:/srv/zabbix-postgres/backups
+    environment:
+      ZABBIX_DB_NAME: zabbixdb
+      ZABBIX_DB_USER: postgres
+      PGPASSWORD: postgres
+    networks:
+      - zabbix-network
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+ 
+  pgadmin:
+    container_name: pgadmin
+    image: dpage/pgadmin4:latest
+    environment:
+      PGADMIN_DEFAULT_EMAIL: 'admin@test.ru'
+      PGADMIN_DEFAULT_PASSWORD: 'postgres'
+    ports:
+      - "5050:80"
+    restart: unless-stopped
